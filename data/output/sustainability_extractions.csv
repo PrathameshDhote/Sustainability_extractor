@@ -1,0 +1,7 @@
+company,indicator_name,value,unit,confidence,source_page,data_quality
+Allied Irish Banks,Total Scope 1 GHG Emissions,1074786.0,tCO2e,1.0,78,high
+Allied Irish Banks,Total Scope 2 GHG Emissions,1071207.0,tCO2e,1.0,78,high
+Allied Irish Banks,Total Scope 3 GHG Emissions,1071207.0,tCO2e,0.3,78,low
+Allied Irish Banks,Female Employees,43.0,%,1.0,4,high
+Allied Irish Banks,Gender Pay Gap,27.0,%,1.0,93,high
+Allied Irish Banks,Training Hours per Employee,1074786.0,hours,0.3,94,low
