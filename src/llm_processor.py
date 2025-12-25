@@ -1,10 +1,9 @@
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+from langchain_community.chat_models import ChatOllama
 import json
+import os
 
 class IndicatorExtraction(BaseModel):
     """Structured output model for indicator extraction"""
@@ -17,28 +16,51 @@ class IndicatorExtraction(BaseModel):
     data_quality: str = Field(description="Quality assessment: 'high', 'medium', or 'low'")
 
 class LLMProcessor:
-    """Handles LLM-based extraction with verification"""
+    """
+    Handles LLM-based extraction with verification
     
-    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0.0):
+    UPDATED: Supports multiple LLM backends:
+    - OpenAI (gpt-4o, gpt-3.5-turbo)
+    - Anthropic (claude-3-5-sonnet, etc.)
+    - Ollama (llama3.1:8b, mistral, etc.) - LOCAL & FREE
+    """
+    
+    def __init__(self, model_name: str = "llama3.1:8b", temperature: float = 0.0):
         self.model_name = model_name
         self.temperature = temperature
         
-        if "gpt" in model_name:
+        # Detect model type and initialize appropriate LLM
+        if "gpt" in model_name.lower():
+            # OpenAI models
             self.llm = ChatOpenAI(
                 model=model_name,
                 temperature=temperature,
                 max_tokens=4000
             )
-        elif "claude" in model_name:
+            self.llm_type = "openai"
+            
+        elif "claude" in model_name.lower():
+            # Anthropic models
+            from langchain_anthropic import ChatAnthropic
             self.llm = ChatAnthropic(
                 model=model_name,
                 temperature=temperature,
                 max_tokens=4000
             )
+            self.llm_type = "anthropic"
+            
         else:
-            raise ValueError(f"Unsupported model: {model_name}")
-        
-        self.parser = PydanticOutputParser(pydantic_object=IndicatorExtraction)
+            # Ollama local models (default)
+            print(f"  Using Ollama local model: {model_name}")
+            print(f"  Make sure Ollama is running: ollama serve")
+            
+            self.llm = ChatOllama(
+                model=model_name,
+                temperature=temperature,
+                base_url="http://localhost:11434",  # Default Ollama port
+                num_predict=4000  # Max tokens for output
+            )
+            self.llm_type = "ollama"
     
     def extract_from_table(self, table_markdown: str, indicator_name: str, 
                           expected_unit: str, esrs_ref: str, 
@@ -71,31 +93,49 @@ CRITICAL INSTRUCTIONS:
 
 5. If the value cannot be found, return null for value and confidence_score of 0.0
 
-{format_instructions}
+Return ONLY valid JSON in this exact format:
+{{
+    "value": <numeric_value or null>,
+    "unit": "<unit>",
+    "source_quote": "<exact text from document>",
+    "page_number": <page_number>,
+    "confidence_score": <0.0 to 1.0>,
+    "extraction_notes": "<any clarifications>",
+    "data_quality": "high|medium|low"
+}}
 
-Return ONLY valid JSON, no additional text."""
+Do not include any explanation or markdown formatting, just the raw JSON."""
 
-        prompt = ChatPromptTemplate.from_template(prompt_template)
-        
-        formatted_prompt = prompt.format(
+        formatted_prompt = prompt_template.format(
             indicator_name=indicator_name,
             esrs_ref=esrs_ref,
             expected_unit=expected_unit,
             page_number=page_number,
-            table_markdown=table_markdown[:8000],  # Limit context
-            format_instructions=self.parser.get_format_instructions()
+            table_markdown=table_markdown[:6000]  # Limit for local models
         )
         
         try:
             response = self.llm.invoke(formatted_prompt)
-            result = self.parser.parse(response.content)
             
-            # Validate result
-            result = self._validate_extraction(result, expected_unit)
+            # Extract content based on LLM type
+            if hasattr(response, 'content'):
+                content = response.content
+            else:
+                content = str(response)
             
-            return result
+            # Parse JSON response
+            result = self._parse_json_response(content)
+            
+            if result:
+                # Convert to IndicatorExtraction object
+                extraction = IndicatorExtraction(**result)
+                extraction = self._validate_extraction(extraction, expected_unit)
+                return extraction
+            
+            return None
+            
         except Exception as e:
-            print(f"Error in table extraction: {e}")
+            print(f"  ⚠ Error in table extraction: {e}")
             return None
     
     def extract_from_narrative(self, text_context: str, indicator_name: str,
@@ -130,32 +170,86 @@ CRITICAL INSTRUCTIONS:
    - 0.5 = Implied from context
    - 0.0 = Not found
 
-{format_instructions}
+Return ONLY valid JSON in this exact format:
+{{
+    "value": <numeric_value or null>,
+    "unit": "<unit>",
+    "source_quote": "<exact sentence from document>",
+    "page_number": <page_number>,
+    "confidence_score": <0.0 to 1.0>,
+    "extraction_notes": "<any clarifications>",
+    "data_quality": "high|medium|low"
+}}
 
-Return ONLY valid JSON."""
+Do not include any explanation, just the raw JSON."""
 
-        prompt = ChatPromptTemplate.from_template(prompt_template)
-        
-        formatted_prompt = prompt.format(
+        formatted_prompt = prompt_template.format(
             indicator_name=indicator_name,
             esrs_ref=esrs_ref,
             expected_unit=expected_unit,
             keywords=", ".join(search_keywords),
             page_number=page_number,
-            text_context=text_context[:10000],  # Larger context for narrative
-            format_instructions=self.parser.get_format_instructions()
+            text_context=text_context[:8000]  # Larger context for narrative
         )
         
         try:
             response = self.llm.invoke(formatted_prompt)
-            result = self.parser.parse(response.content)
             
-            result = self._validate_extraction(result, expected_unit)
+            if hasattr(response, 'content'):
+                content = response.content
+            else:
+                content = str(response)
             
-            return result
-        except Exception as e:
-            print(f"Error in narrative extraction: {e}")
+            result = self._parse_json_response(content)
+            
+            if result:
+                extraction = IndicatorExtraction(**result)
+                extraction = self._validate_extraction(extraction, expected_unit)
+                return extraction
+            
             return None
+            
+        except Exception as e:
+            print(f"  ⚠ Error in narrative extraction: {e}")
+            return None
+    
+    def _parse_json_response(self, content: str) -> Optional[Dict]:
+        """
+        Parse JSON from LLM response, handling various formats
+        """
+        # Try direct JSON parse first
+        try:
+            return json.loads(content)
+        except:
+            pass
+        
+        # Try to extract JSON from markdown code blocks
+        if "```json" in content:
+            try:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+                return json.loads(json_str)
+            except:
+                pass
+        
+        if "```" in content:
+            try:
+                json_str = content.split("```")[1].split("```")[0].strip()
+                return json.loads(json_str)
+            except:
+                pass
+        
+        # Try to find JSON object in text
+        try:
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start != -1 and end > start:
+                json_str = content[start:end]
+                return json.loads(json_str)
+        except:
+            pass
+        
+        print(f"  ⚠ Could not parse JSON from response: {content[:200]}")
+        return None
     
     def verify_extraction(self, extraction: IndicatorExtraction, 
                          original_text: str) -> float:
@@ -166,32 +260,32 @@ Return ONLY valid JSON."""
         if not extraction.source_quote:
             return extraction.confidence_score * 0.5
         
-        # Check if quote exists in original (fuzzy match)
         quote_lower = extraction.source_quote.lower()
         text_lower = original_text.lower()
         
         if quote_lower in text_lower:
-            return extraction.confidence_score  # Full confidence
+            return extraction.confidence_score
         
-        # Check for partial match (at least 50% of words)
         quote_words = set(quote_lower.split())
         text_words = set(text_lower.split())
         
         overlap = len(quote_words.intersection(text_words)) / len(quote_words) if quote_words else 0
         
         if overlap > 0.5:
-            return extraction.confidence_score * 0.9  # Minor penalty
+            return extraction.confidence_score * 0.9
         else:
-            return extraction.confidence_score * 0.6  # Significant penalty
+            return extraction.confidence_score * 0.6
     
     def _validate_extraction(self, extraction: IndicatorExtraction, 
                             expected_unit: str) -> IndicatorExtraction:
         """Validate and clean extraction result"""
         
-        # Check unit consistency
-        if extraction.unit != expected_unit:
-            extraction.extraction_notes += f" | Unit mismatch: expected {expected_unit}, got {extraction.unit}"
-            extraction.confidence_score *= 0.8
+        # Check unit consistency (flexible for local models)
+        if extraction.unit.lower() != expected_unit.lower():
+            # Check if units are similar (e.g., "tCO2e" vs "tco2e")
+            if extraction.unit.replace(" ", "").lower() != expected_unit.replace(" ", "").lower():
+                extraction.extraction_notes += f" | Unit mismatch: expected {expected_unit}, got {extraction.unit}"
+                extraction.confidence_score *= 0.8
         
         # Validate confidence range
         extraction.confidence_score = max(0.0, min(1.0, extraction.confidence_score))
